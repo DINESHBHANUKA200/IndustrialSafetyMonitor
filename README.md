@@ -40,5 +40,5 @@ This project is an **IoT-based Industrial Safety Monitor System** designed to tr
 ### Software Setup
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-username/Industrial-Safety-Monitor.git
+   git clone https://github.com/DINESHBHANUKA200/IndustrialSafetyMonitor.git
 
