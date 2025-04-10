@@ -1,0 +1,193 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "driver/i2c.h"
+#include "Adafruit_SSD1306.h"
+#include "DHT.h"
+#include "math.h"
+
+// OLED Setup
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &i2c, OLED_RESET);
+
+// BMP180 Setup
+Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085);
+#define SEA_LEVEL_PRESSURE_HPA 1013.25
+
+// DHT Setup
+#define DHT_PIN 32
+#define DHT_TYPE DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// MQ Sensor Setup
+#define MQ4_PIN 34
+#define MQ135_PIN 35
+#define MQ4_LED_GREEN 2
+#define MQ4_LED_YELLOW 4
+#define MQ4_LED_RED 16
+#define MQ135_LED_GREEN 5
+#define MQ135_LED_YELLOW 18
+#define MQ135_LED_RED 19
+#define RL_VALUE 10.0
+#define R0_MQ4 9.83
+#define R0_MQ135 9.83
+
+// Voltage Sensor Setup
+#define VOLTAGE_SENSOR_PIN 33
+#define REF_VOLTAGE    3.3
+#define ADC_RESOLUTION 4095.0
+#define R1             30000.0
+#define R2             7500.0
+
+// Vibration Sensor Setup
+int Vibration_signal = 14; // Vibration sensor signal pin
+int Sensor_State = 1;
+
+// Function to initialize I2C for OLED
+esp_err_t i2c_master_init() {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = 21,
+        .scl_io_num = 22,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .clk_speed = 100000
+    };
+    esp_err_t ret = i2c_param_config(I2C_NUM_0, &conf);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    ret = i2c_driver_install(I2C_NUM_0, conf.mode, 0, 0, 0);
+    return ret;
+}
+
+// Function to read MQ-4 PPM value
+float calculatePPM_MQ4(float Rs) {
+    return 1021 * pow((Rs / R0_MQ4), -2.7887);
+}
+
+// Function to read MQ-135 PPM value
+float calculatePPM_MQ135(float Rs) {
+    return 116.602 * pow((Rs / R0_MQ135), -2.769);
+}
+
+// Function to get air quality category
+String getAirQualityCategory(float ppm, float goodThreshold, float moderateThreshold) {
+    if (ppm < goodThreshold) return "Good";
+    else if (ppm < moderateThreshold) return "Moderate";
+    else return "Poor";
+}
+
+// Main Task for sensor reading and display
+void sensor_reading_task(void *pvParameter) {
+    while (1) {
+        // Read Vibration Sensor
+        Sensor_State = gpio_get_level(Vibration_signal);
+
+        // Read DHT22
+        float temperature_dht = dht.readTemperature();
+        float humidity = dht.readHumidity();
+
+        // Read MQ-4
+        int val_MQ4 = adc1_get_raw(MQ4_PIN);
+        float volt_MQ4 = (val_MQ4 / ADC_RESOLUTION) * 5.0;
+        float Rs_MQ4 = RL_VALUE * ((5.0 / volt_MQ4) - 1);
+        float ppm_MQ4 = calculatePPM_MQ4(Rs_MQ4);
+        String aq_MQ4 = getAirQualityCategory(ppm_MQ4, 300, 600);
+
+        // Read MQ-135
+        int val_MQ135 = adc1_get_raw(MQ135_PIN);
+        float volt_MQ135 = (val_MQ135 / ADC_RESOLUTION) * 5.0;
+        float Rs_MQ135 = RL_VALUE * ((5.0 / volt_MQ135) - 1);
+        float ppm_MQ135 = calculatePPM_MQ135(Rs_MQ135);
+        String aq_MQ135 = getAirQualityCategory(ppm_MQ135, 400, 1000);
+
+        // Update LEDs
+        gpio_set_level(MQ4_LED_GREEN, (aq_MQ4 == "Good"));
+        gpio_set_level(MQ4_LED_YELLOW, (aq_MQ4 == "Moderate"));
+        gpio_set_level(MQ4_LED_RED, (aq_MQ4 == "Poor"));
+        gpio_set_level(MQ135_LED_GREEN, (aq_MQ135 == "Good"));
+        gpio_set_level(MQ135_LED_YELLOW, (aq_MQ135 == "Moderate"));
+        gpio_set_level(MQ135_LED_RED, (aq_MQ135 == "Poor"));
+
+        // Read BMP180
+        sensors_event_t event;
+        bmp.getEvent(&event);
+        float pressure = event.pressure;
+        float temperature_bmp;
+        bmp.getTemperature(&temperature_bmp);
+        float altitude = 44330 * (1 - pow((pressure / SEA_LEVEL_PRESSURE_HPA), 1.0 / 5.255));
+
+        // Read Voltage Sensor
+        int adc_val = adc1_get_raw(VOLTAGE_SENSOR_PIN);
+        float volt_adc = ((float)adc_val * REF_VOLTAGE) / ADC_RESOLUTION;
+        float voltage_in = volt_adc * (R1 + R2) / R2;
+
+        // Serial Output
+        ESP_LOGI("Sensor Data", "Vibration: %s", (Sensor_State == 1) ? "Detected" : "None");
+        ESP_LOGI("Sensor Data", "MQ-4: %.2f ppm (%s)", ppm_MQ4, aq_MQ4.c_str());
+        ESP_LOGI("Sensor Data", "MQ-135: %.2f ppm (%s)", ppm_MQ135, aq_MQ135.c_str());
+        ESP_LOGI("Sensor Data", "DHT Temp: %.2f C | Humidity: %.2f%%", temperature_dht, humidity);
+        ESP_LOGI("Sensor Data", "BMP Temp: %.2f C | Pressure: %.2f hPa | Altitude: %.2f m", temperature_bmp, pressure, altitude);
+        ESP_LOGI("Sensor Data", "Voltage: %.2f V", voltage_in);
+
+        // OLED Display
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0, 0);
+        display.printf("Vibration: %s\n", (Sensor_State == 1) ? "Detected" : "None");
+        display.printf("MQ4: %.2f ppm (%s)\n", ppm_MQ4, aq_MQ4.c_str());
+        display.printf("MQ135: %.2f ppm (%s)\n", ppm_MQ135, aq_MQ135.c_str());
+        display.printf("T:%.1fC H:%.0f%%\n", temperature_dht, humidity);
+        display.printf("P:%.0fhPa A:%.0fm\n", pressure, altitude);
+        display.printf("V:%.2fV\n", voltage_in);
+        display.display();
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Delay for 1 second
+    }
+}
+
+void app_main() {
+    // Initialize I2C
+    esp_err_t ret = i2c_master_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE("I2C", "I2C initialization failed");
+        return;
+    }
+
+    // Initialize OLED
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        ESP_LOGE("OLED", "OLED init failed");
+        return;
+    }
+
+    // Initialize DHT
+    dht.begin();
+
+    // Initialize BMP180
+    if (!bmp.begin()) {
+        ESP_LOGE("BMP180", "BMP180 not found!");
+        return;
+    }
+
+    // Initialize LED Pins
+    gpio_set_direction(MQ4_LED_GREEN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MQ4_LED_YELLOW, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MQ4_LED_RED, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MQ135_LED_GREEN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MQ135_LED_YELLOW, GPIO_MODE_OUTPUT);
+    gpio_set_direction(MQ135_LED_RED, GPIO_MODE_OUTPUT);
+
+    // Initialize Vibration Sensor Pin
+    gpio_set_direction(Vibration_signal, GPIO_MODE_INPUT);
+
+    // Create the sensor reading task
+    xTaskCreate(&sensor_reading_task, "Sensor Reading Task", 4096, NULL, 5, NULL);
+}
